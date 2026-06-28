@@ -70,6 +70,35 @@ These fallback modes still download the X videos, OCR frames, upload images, and
 
 While running, progress is printed as JSON lines. You should see `download_start`, `download`, `ocr_start`, frame counters, `merge`, and `processed` messages. The red Python 3.8 deprecation warnings from `yt-dlp` are not job failures.
 
+## Speed Tuning
+
+By default the runner now does a sparse soft scan first. It checks one frame every 5 seconds with cheap English OCR, then runs full Hindi/name/price extraction only near matching stock-call card frames.
+
+Recommended full run on the 32 vCPU pod:
+
+```bash
+source .env
+bash runpod_bootstrap.sh --existing-video-jobs --skip-discovery --start 2023-04-01 --concurrency 16 --no-clear-enriched
+```
+
+Faster but slightly riskier:
+
+```bash
+bash runpod_bootstrap.sh --existing-video-jobs --skip-discovery --start 2023-04-01 --concurrency 20 --soft-scan-fps 0.1 --deep-window 5 --deep-step 2 --no-clear-enriched
+```
+
+Safer but slower:
+
+```bash
+bash runpod_bootstrap.sh --existing-video-jobs --skip-discovery --start 2023-04-01 --concurrency 12 --soft-scan-fps 0.5 --deep-window 8 --deep-step 1 --no-clear-enriched
+```
+
+Fallback to the old full-scan behavior:
+
+```bash
+bash runpod_bootstrap.sh --existing-video-jobs --skip-discovery --no-soft-scan --frame-fps 1 --no-clear-enriched
+```
+
 ## IP Rotation
 
 Nitter can block or rate-limit a pod IP. The script supports proxy rotation for Nitter discovery and yt-dlp/X video downloads.

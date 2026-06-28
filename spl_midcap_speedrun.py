@@ -173,6 +173,11 @@ class Config:
     frame_fps: float
     max_frames: int
     min_card_frames: int
+    soft_scan: bool
+    soft_scan_fps: float
+    soft_max_frames: int
+    deep_window: float
+    deep_step: float
     clear_enriched: bool
     cleanup_videos: bool
     existing_video_jobs: bool
@@ -403,12 +408,26 @@ def ocr(frame, x0, x1, y0, y1, *, psm=7, lang="eng", whitelist=None, fx=4.0) -> 
 
 
 def find_band_y(frame) -> float | None:
-    for i in range(84, 116):
-        y = i / 200
+    coarse = (0.42, 0.45, 0.48, 0.51, 0.54, 0.57)
+    fine = [i / 200 for i in range(84, 116, 2)]
+    for y in list(coarse) + [x for x in fine if x not in coarse]:
         text = ocr(frame, PANEL_X[0], PANEL_X[1], y, y + 0.04, psm=6, fx=3.0).lower()
         if "target" in text and ("stop" in text or "loss" in text or "duration" in text):
             return y
     return None
+
+
+def quick_card_signal(frame) -> tuple[bool, str]:
+    text = ocr(frame, 0.02, 0.56, 0.18, 0.76, psm=6, lang="eng", fx=2.0).lower()
+    if not text:
+        return False, ""
+    has_target = "target" in text or "tgt" in text
+    has_risk = "stop" in text or "loss" in text or "duration" in text
+    has_action = "buy" in text or "sell" in text
+    has_numbers = len(re.findall(r"\d{2,}", text)) >= 2
+    has_entry = "@" in text or "cmp" in text
+    ok = has_target and has_numbers and (has_risk or has_action or has_entry)
+    return ok, re.sub(r"\s+", " ", text).strip()[:160]
 
 
 def valid_stock_name(name: str | None) -> bool:
@@ -690,6 +709,32 @@ def iter_sampled_frames(video_path: Path, fps: float, max_frames: int):
     cap.release()
 
 
+def soft_scan_candidates(video_path: Path, cfg: Config, job_id: str) -> tuple[list[float], int]:
+    hits: list[float] = []
+    checked = 0
+    for ts, frame in iter_sampled_frames(video_path, cfg.soft_scan_fps, cfg.soft_max_frames):
+        checked += 1
+        ok, snippet = quick_card_signal(frame)
+        if ok:
+            hits.append(ts)
+            log_event({"job": job_id, "phase": "soft_hit", "ts": round(ts, 2), "text": snippet})
+        if checked % 25 == 0:
+            log_event({"job": job_id, "phase": "soft_scan", "checked": checked, "hits": len(hits)})
+    return hits, checked
+
+
+def expanded_deep_timestamps(hits: list[float], window: float, step: float) -> list[float]:
+    if not hits:
+        return []
+    out: set[float] = set()
+    step = max(step, 0.5)
+    slots = int(window / step)
+    for hit in hits:
+        for i in range(-slots, slots + 1):
+            out.add(round(max(0.0, hit + i * step), 2))
+    return sorted(out)
+
+
 def frame_at(video_path: Path, ts: float):
     cap = cv2.VideoCapture(str(video_path))
     cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, ts) * 1000.0)
@@ -848,20 +893,59 @@ def process_video(cfg: Config, supa: Supabase, url: str) -> tuple[dict, list[dic
     proxy = rotated_proxy(cfg, url)
     log_event({"job": job_id, "phase": "start", "url": url})
     video_path = download_video(url, job_dir, proxy=proxy, job_id=job_id)
-    log_event({"job": job_id, "phase": "ocr_start", "video_file": video_path.name})
+    ocr_started = time.time()
+    log_event({"job": job_id, "phase": "ocr_start", "video_file": video_path.name, "soft_scan": cfg.soft_scan})
     records = []
     done = 0
-    for ts, frame in iter_sampled_frames(video_path, cfg.frame_fps, cfg.max_frames):
+    soft_checked = 0
+    if cfg.soft_scan:
+        hits, soft_checked = soft_scan_candidates(video_path, cfg, job_id)
+        deep_ts = expanded_deep_timestamps(hits, cfg.deep_window, cfg.deep_step)
+        log_event(
+            {
+                "job": job_id,
+                "phase": "deep_plan",
+                "soft_checked": soft_checked,
+                "soft_hits": len(hits),
+                "deep_frames": len(deep_ts),
+            }
+        )
+        frame_iter = ((ts, frame_at(video_path, ts)) for ts in deep_ts[: cfg.max_frames])
+    else:
+        frame_iter = iter_sampled_frames(video_path, cfg.frame_fps, cfg.max_frames)
+
+    for ts, frame in frame_iter:
+        if frame is None:
+            continue
         done += 1
         parsed = extract_card(frame)
         if parsed and valid_stock_name(parsed.get("stock")) and parsed.get("targets"):
             parsed["_ts"] = ts
             records.append(parsed)
-        if done % 25 == 0:
-            log_event({"job": job_id, "frames": done, "candidate_reads": len(records)})
+        if done % 10 == 0:
+            elapsed = max(time.time() - ocr_started, 0.001)
+            log_event(
+                {
+                    "job": job_id,
+                    "phase": "deep_ocr",
+                    "frames": done,
+                    "candidate_reads": len(records),
+                    "fps": round(done / elapsed, 2),
+                }
+            )
 
     merged = merge_cards(records, cfg.min_card_frames)
-    log_event({"job": job_id, "phase": "merge", "frames": done, "candidate_reads": len(records), "cards": len(merged)})
+    log_event(
+        {
+            "job": job_id,
+            "phase": "merge",
+            "soft_checked": soft_checked,
+            "frames": done,
+            "candidate_reads": len(records),
+            "cards": len(merged),
+            "seconds": round(time.time() - ocr_started, 1),
+        }
+    )
     cards = []
     calls = []
     enriched = []
@@ -935,7 +1019,7 @@ def process_video(cfg: Config, supa: Supabase, url: str) -> tuple[dict, list[dic
         "video_file": None,
         "template_id": "zbusiness",
         "template_name": "ZBusiness analyst call card",
-        "frames_total": done,
+        "frames_total": soft_checked + done,
         "frames_done": done,
         "cards_found": len(cards),
         "calls_added": len(calls),
@@ -957,9 +1041,14 @@ def parse_args() -> Config:
     p.add_argument("--end", type=parse_day, default=datetime.now(timezone.utc).date())
     p.add_argument("--limit", type=int, default=200)
     p.add_argument("--concurrency", type=int, default=int(os.getenv("RUNPOD_CONCURRENCY", "16")))
-    p.add_argument("--frame-fps", type=float, default=1.0)
+    p.add_argument("--frame-fps", type=float, default=1.0, help="Full-scan FPS when --no-soft-scan is used")
     p.add_argument("--max-frames", type=int, default=1200)
     p.add_argument("--min-card-frames", type=int, default=2)
+    p.add_argument("--no-soft-scan", action="store_true", help="Disable sparse preflight scan and run full extraction on sampled frames")
+    p.add_argument("--soft-scan-fps", type=float, default=float(os.getenv("RUNPOD_SOFT_SCAN_FPS", "0.2")), help="Cheap preflight scan FPS; 0.2 means one frame every 5 seconds")
+    p.add_argument("--soft-max-frames", type=int, default=int(os.getenv("RUNPOD_SOFT_MAX_FRAMES", "240")), help="Max frames checked by soft scan before deep OCR")
+    p.add_argument("--deep-window", type=float, default=float(os.getenv("RUNPOD_DEEP_WINDOW", "6")), help="Seconds around each soft hit to deep OCR")
+    p.add_argument("--deep-step", type=float, default=float(os.getenv("RUNPOD_DEEP_STEP", "2")), help="Seconds between deep OCR frames around each hit")
     p.add_argument("--bucket", default=os.getenv("SUPABASE_MEDIA_BUCKET", "stock-call-media"))
     p.add_argument("--table", default=os.getenv("SUPABASE_DATA_TABLE", "app_records"))
     p.add_argument("--nitter", default=",".join(DEFAULT_NITTER))
@@ -999,6 +1088,11 @@ def parse_args() -> Config:
         frame_fps=args.frame_fps,
         max_frames=args.max_frames,
         min_card_frames=args.min_card_frames,
+        soft_scan=not args.no_soft_scan,
+        soft_scan_fps=args.soft_scan_fps,
+        soft_max_frames=args.soft_max_frames,
+        deep_window=args.deep_window,
+        deep_step=args.deep_step,
         clear_enriched=not args.no_clear_enriched,
         cleanup_videos=not args.keep_source_videos,
         existing_video_jobs=args.existing_video_jobs,
@@ -1022,6 +1116,11 @@ def main() -> None:
             "existing_video_jobs": cfg.existing_video_jobs,
             "urls_file": bool(cfg.urls_file),
             "skip_discovery": cfg.skip_discovery,
+            "soft_scan": cfg.soft_scan,
+            "soft_scan_fps": cfg.soft_scan_fps,
+            "soft_max_frames": cfg.soft_max_frames,
+            "deep_window": cfg.deep_window,
+            "deep_step": cfg.deep_step,
         }
     )
     if cfg.clear_enriched:

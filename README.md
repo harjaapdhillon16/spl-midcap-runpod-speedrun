@@ -16,6 +16,8 @@ Do not use Serverless, Public endpoints, or Clusters for this job. This is a one
 
 This workload is mostly CPU/Tesseract/ffmpeg/network, so the 32 vCPU CPU pod is better value than the H200 GPU pod.
 
+Source videos are downloaded only to the pod's local disk for OCR. The script uploads only extracted call-card PNG frames to Supabase Storage, then deletes the local source video by default.
+
 ## Files
 
 - `spl_midcap_speedrun.py` - standalone Python runner, no project imports
@@ -65,6 +67,8 @@ bash runpod_bootstrap.sh --urls-file /workspace/zee_urls.txt --skip-discovery --
 ```
 
 These fallback modes still download the X videos, OCR frames, upload images, and write Supabase rows.
+
+While running, progress is printed as JSON lines. You should see `download_start`, `download`, `ocr_start`, frame counters, `merge`, and `processed` messages. The red Python 3.8 deprecation warnings from `yt-dlp` are not job failures.
 
 ## IP Rotation
 

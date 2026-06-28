@@ -17,12 +17,12 @@ Run:
 
 What this script does:
   - searches Nitter for ZeeBusiness #splmidcapstocks videos month-by-month
-  - downloads videos with yt-dlp
+  - downloads videos with yt-dlp to local pod disk only
   - samples frames with OpenCV
   - OCRs stock call cards with Tesseract
   - keeps the representative frame that contains the Hindi analyst line
   - stores analyst name in Hindi on the individual stock call row
-  - uploads call-card PNGs to Supabase Storage
+  - uploads call-card PNGs to Supabase Storage; it does not upload source videos
   - writes video_jobs, stock_calls, and enriched_calls into app_records
   - clears enriched_calls before rebuilding unless --no-clear-enriched is used
 
@@ -48,12 +48,15 @@ import sys
 import tempfile
 import time
 import uuid
+import warnings
 from collections import Counter
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote, urljoin
 
+os.environ.setdefault("PYTHONWARNINGS", "ignore::DeprecationWarning")
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 PY_DEPS = {
     "httpx": "httpx",
@@ -613,17 +616,41 @@ def merge_cards(records: list[dict], min_support: int) -> list[dict]:
     return merged
 
 
-def download_video(url: str, outdir: Path, proxy: str | None = None) -> Path:
+def download_video(url: str, outdir: Path, proxy: str | None = None, job_id: str | None = None) -> Path:
     outdir.mkdir(parents=True, exist_ok=True)
+    progress_last = {"ts": 0.0}
+
+    def progress_hook(status: dict) -> None:
+        now = time.time()
+        state = status.get("status")
+        label = job_id or stable_id(url)
+        if state == "downloading" and now - progress_last["ts"] >= 10:
+            progress_last["ts"] = now
+            downloaded = status.get("downloaded_bytes") or 0
+            total = status.get("total_bytes") or status.get("total_bytes_estimate") or 0
+            row = {
+                "job": label,
+                "phase": "download",
+                "downloaded_mb": round(downloaded / 1024 / 1024, 1),
+            }
+            if total:
+                row["total_mb"] = round(total / 1024 / 1024, 1)
+                row["pct"] = round(downloaded / total * 100, 1)
+            print(row, flush=True)
+        elif state == "finished":
+            print({"job": label, "phase": "download_finished", "filename": Path(status.get("filename", "")).name}, flush=True)
+
     opts = {
         "outtmpl": str(outdir / "%(id)s.%(ext)s"),
         "format": "bestvideo+bestaudio/best",
         "merge_output_format": "mp4",
         "quiet": True,
         "no_warnings": True,
+        "progress_hooks": [progress_hook],
     }
     if proxy:
         opts["proxy"] = proxy
+    print({"job": job_id or stable_id(url), "phase": "download_start", "url": url, "proxy": bool(proxy)}, flush=True)
     with YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
         path = Path(ydl.prepare_filename(info))
@@ -809,7 +836,9 @@ def process_video(cfg: Config, supa: Supabase, url: str) -> tuple[dict, list[dic
     frame_dir.mkdir(parents=True, exist_ok=True)
     started = utcnow()
     proxy = rotated_proxy(cfg, url)
-    video_path = download_video(url, job_dir, proxy=proxy)
+    print({"job": job_id, "phase": "start", "url": url}, flush=True)
+    video_path = download_video(url, job_dir, proxy=proxy, job_id=job_id)
+    print({"job": job_id, "phase": "ocr_start", "video_file": video_path.name}, flush=True)
     records = []
     done = 0
     for ts, frame in iter_sampled_frames(video_path, cfg.frame_fps, cfg.max_frames):
@@ -818,10 +847,11 @@ def process_video(cfg: Config, supa: Supabase, url: str) -> tuple[dict, list[dic
         if parsed and valid_stock_name(parsed.get("stock")) and parsed.get("targets"):
             parsed["_ts"] = ts
             records.append(parsed)
-        if done % 50 == 0:
+        if done % 25 == 0:
             print({"job": job_id, "frames": done, "candidate_reads": len(records)}, flush=True)
 
     merged = merge_cards(records, cfg.min_card_frames)
+    print({"job": job_id, "phase": "merge", "frames": done, "candidate_reads": len(records), "cards": len(merged)}, flush=True)
     cards = []
     calls = []
     enriched = []
@@ -1031,6 +1061,14 @@ def main() -> None:
     all_jobs, all_calls, all_enriched = [], [], []
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
+    print(
+        {
+            "queue": len(urls),
+            "workers": cfg.concurrency,
+            "storage": "uploads call-card PNG frames only; source videos stay local and are deleted after OCR",
+        },
+        flush=True,
+    )
     with ThreadPoolExecutor(max_workers=cfg.concurrency) as pool:
         futures = {pool.submit(process_video, cfg, supa, url): url for url in urls}
         for i, fut in enumerate(as_completed(futures), 1):
@@ -1041,13 +1079,14 @@ def main() -> None:
                 all_calls.extend(calls)
                 all_enriched.extend(enriched)
                 print({"processed": f"{i}/{len(urls)}", "url": url, "cards": len(calls)}, flush=True)
+                supa.upsert_records("video_jobs", [job])
+                supa.upsert_records("stock_calls", calls)
+                supa.upsert_records("enriched_calls", enriched, id_key="call_id")
             except Exception as exc:  # noqa: BLE001
                 print({"failed": url, "error": str(exc)}, flush=True)
 
             if i % 10 == 0:
-                supa.upsert_records("video_jobs", all_jobs)
-                supa.upsert_records("stock_calls", all_calls)
-                supa.upsert_records("enriched_calls", all_enriched, id_key="call_id")
+                print({"checkpoint": f"{i}/{len(urls)}", "jobs_done": len(all_jobs), "calls": len(all_calls)}, flush=True)
 
     supa.upsert_records("video_jobs", all_jobs)
     supa.upsert_records("stock_calls", all_calls)

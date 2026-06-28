@@ -22,6 +22,7 @@ Source videos are downloaded only to the pod's local disk for OCR. The script up
 
 - `spl_midcap_speedrun.py` - standalone Python runner, no project imports
 - `runpod_bootstrap.sh` - installs system packages and runs the runner
+- `run_background.sh` - starts the runner in the background and writes logs/pid in this directory
 - `.env.example` - env vars to set manually in the RunPod terminal
 
 ## Run
@@ -41,7 +42,7 @@ For a test month:
 bash runpod_bootstrap.sh --start 2024-02-01 --end 2024-02-29 --concurrency 8
 ```
 
-The script clears `enriched_calls` by default. Add `--no-clear-enriched` if you do not want that.
+The runner is resumable by default. It preserves `enriched_calls`, removes duplicates, and skips videos whose source URL already exists in `enriched_calls`. Use `--clear-enriched` only when you intentionally want a destructive rebuild.
 
 ## If Nitter Is Blocked
 
@@ -53,6 +54,21 @@ Fast fallback: use ZeeBusiness video URLs already present in Supabase `video_job
 git pull
 source .env
 bash runpod_bootstrap.sh --existing-video-jobs --skip-discovery --start 2023-04-01 --concurrency 16
+```
+
+Run the same resumable job in the background:
+
+```bash
+git pull
+source .env
+bash ./run_background.sh
+tail -f ./spl_midcap_run.log
+```
+
+Stop a background run:
+
+```bash
+kill "$(cat ./spl_midcap_run.pid)"
 ```
 
 Manual fallback: put one ZeeBusiness status/video URL per line in a file:
@@ -78,26 +94,32 @@ Recommended full run on the 32 vCPU pod:
 
 ```bash
 source .env
-bash runpod_bootstrap.sh --existing-video-jobs --skip-discovery --start 2023-04-01 --concurrency 16 --no-clear-enriched
+bash runpod_bootstrap.sh --existing-video-jobs --skip-discovery --start 2023-04-01 --concurrency 16
 ```
 
 Faster but slightly riskier:
 
 ```bash
-bash runpod_bootstrap.sh --existing-video-jobs --skip-discovery --start 2023-04-01 --concurrency 20 --soft-scan-fps 0.1 --deep-window 5 --deep-step 2 --no-clear-enriched
+bash runpod_bootstrap.sh --existing-video-jobs --skip-discovery --start 2023-04-01 --concurrency 20 --soft-scan-fps 0.1 --deep-window 5 --deep-step 2
 ```
 
 Safer but slower:
 
 ```bash
-bash runpod_bootstrap.sh --existing-video-jobs --skip-discovery --start 2023-04-01 --concurrency 12 --soft-scan-fps 0.5 --deep-window 8 --deep-step 1 --no-clear-enriched
+bash runpod_bootstrap.sh --existing-video-jobs --skip-discovery --start 2023-04-01 --concurrency 12 --soft-scan-fps 0.5 --deep-window 8 --deep-step 1
 ```
 
 Fallback to the old full-scan behavior:
 
 ```bash
-bash runpod_bootstrap.sh --existing-video-jobs --skip-discovery --no-soft-scan --frame-fps 1 --no-clear-enriched
+bash runpod_bootstrap.sh --existing-video-jobs --skip-discovery --no-soft-scan --frame-fps 1
 ```
+
+Useful resume controls:
+
+- `--skip-processed` is on by default; it skips any video URL already present in `enriched_calls.source_url`.
+- `--cleanup-duplicates` is on by default; it deletes duplicate `enriched_calls` and duplicate `video_jobs` rows before queueing.
+- `--clear-enriched` is destructive and should only be used for a full rebuild.
 
 ## IP Rotation
 

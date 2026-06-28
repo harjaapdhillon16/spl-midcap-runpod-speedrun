@@ -41,6 +41,31 @@ bash runpod_bootstrap.sh --start 2024-02-01 --end 2024-02-29 --concurrency 8
 
 The script clears `enriched_calls` by default. Add `--no-clear-enriched` if you do not want that.
 
+## If Nitter Is Blocked
+
+If the run prints `403 Forbidden` for every Nitter instance and then `videos: 0`, the pod is fine but Nitter discovery is blocked from that RunPod IP.
+
+Fast fallback: use ZeeBusiness video URLs already present in Supabase `video_jobs` and skip Nitter:
+
+```bash
+git pull
+source .env
+bash runpod_bootstrap.sh --existing-video-jobs --skip-discovery --start 2023-04-01 --concurrency 16
+```
+
+Manual fallback: put one ZeeBusiness status/video URL per line in a file:
+
+```bash
+cat > /workspace/zee_urls.txt <<'EOF'
+https://x.com/ZeeBusiness/status/1234567890/video/1
+EOF
+
+source .env
+bash runpod_bootstrap.sh --urls-file /workspace/zee_urls.txt --skip-discovery --concurrency 16
+```
+
+These fallback modes still download the X videos, OCR frames, upload images, and write Supabase rows.
+
 ## IP Rotation
 
 Nitter can block or rate-limit a pod IP. The script supports proxy rotation for Nitter discovery and yt-dlp/X video downloads.

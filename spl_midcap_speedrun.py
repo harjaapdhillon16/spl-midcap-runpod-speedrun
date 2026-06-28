@@ -162,6 +162,9 @@ class Config:
     min_card_frames: int
     clear_enriched: bool
     cleanup_videos: bool
+    existing_video_jobs: bool
+    urls_file: str | None
+    skip_discovery: bool
     workdir: Path
 
 
@@ -297,6 +300,51 @@ def discover_month(cfg: Config, lo: date, hi: date) -> list[str]:
             time.sleep(1.0 if not cfg.proxies else 0.25)
         if urls:
             return urls
+    return urls
+
+
+def normalize_video_url(url: str | None) -> str | None:
+    if not url:
+        return None
+    m = re.search(r"/(?:ZeeBusiness|zeebusiness)/status/(\d+)", url, re.I)
+    if not m:
+        m = re.search(r"(?:twitter|x)\.com/i/status/(\d+)", url, re.I)
+    if not m:
+        return None
+    return f"https://x.com/ZeeBusiness/status/{m.group(1)}/video/1"
+
+
+def add_unique_urls(target: list[str], seen: set[str], source_urls: list[str]) -> int:
+    added = 0
+    for raw in source_urls:
+        url = normalize_video_url(raw)
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        target.append(url)
+        added += 1
+    return added
+
+
+def urls_from_file(path: str) -> list[str]:
+    src = Path(path)
+    if not src.exists():
+        raise SystemExit(f"URLs file not found: {path}")
+    urls = []
+    for line in src.read_text().splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            urls.append(line)
+    return urls
+
+
+def urls_from_existing_video_jobs(supa: Supabase) -> list[str]:
+    urls = []
+    for row in supa.list_records("video_jobs"):
+        raw = row.get("url") or row.get("tweet_url") or row.get("source_url")
+        url = normalize_video_url(raw)
+        if url:
+            urls.append(url)
     return urls
 
 
@@ -878,6 +926,9 @@ def parse_args() -> Config:
     p.add_argument("--proxy-list", default=os.getenv("PROXY_LIST", ""), help="Comma-separated http/socks proxies for Nitter and yt-dlp")
     p.add_argument("--proxy-file", default=os.getenv("PROXY_FILE", ""), help="File with one proxy per line")
     p.add_argument("--workdir", default="./spl_speedrun_work")
+    p.add_argument("--existing-video-jobs", action="store_true", help="Process ZeeBusiness URLs already stored in Supabase video_jobs")
+    p.add_argument("--urls-file", default=os.getenv("URLS_FILE", ""), help="File containing one ZeeBusiness X/Twitter/Nitter status URL per line")
+    p.add_argument("--skip-discovery", action="store_true", help="Do not call Nitter; use --existing-video-jobs and/or --urls-file only")
     p.add_argument("--no-clear-enriched", action="store_true")
     p.add_argument("--keep-source-videos", action="store_true")
     args = p.parse_args()
@@ -910,6 +961,9 @@ def parse_args() -> Config:
         min_card_frames=args.min_card_frames,
         clear_enriched=not args.no_clear_enriched,
         cleanup_videos=not args.keep_source_videos,
+        existing_video_jobs=args.existing_video_jobs,
+        urls_file=args.urls_file or None,
+        skip_discovery=args.skip_discovery,
         workdir=Path(args.workdir),
     )
 
@@ -925,6 +979,9 @@ def main() -> None:
             "concurrency": cfg.concurrency,
             "proxies": len(cfg.proxies),
             "nitter_instances": len(cfg.nitter_instances),
+            "existing_video_jobs": cfg.existing_video_jobs,
+            "urls_file": bool(cfg.urls_file),
+            "skip_discovery": cfg.skip_discovery,
         },
         flush=True,
     )
@@ -934,14 +991,42 @@ def main() -> None:
 
     urls = []
     seen = set()
-    windows = month_windows(cfg.start, cfg.end)
-    for idx, (lo, hi) in enumerate(windows, 1):
-        found = discover_month(cfg, lo, hi)
-        for url in found:
-            if url not in seen:
-                seen.add(url)
-                urls.append(url)
-        print({"discover": f"{idx}/{len(windows)}", "month": f"{lo}..{hi}", "found": len(found), "total_urls": len(urls)}, flush=True)
+
+    if cfg.urls_file:
+        file_urls = urls_from_file(cfg.urls_file)
+        added = add_unique_urls(urls, seen, file_urls)
+        print({"urls_file": cfg.urls_file, "found": len(file_urls), "added": added, "total_urls": len(urls)}, flush=True)
+
+    if cfg.existing_video_jobs:
+        existing_urls = urls_from_existing_video_jobs(supa)
+        added = add_unique_urls(urls, seen, existing_urls)
+        print({"existing_video_jobs": True, "found": len(existing_urls), "added": added, "total_urls": len(urls)}, flush=True)
+
+    if not cfg.skip_discovery:
+        windows = month_windows(cfg.start, cfg.end)
+        for idx, (lo, hi) in enumerate(windows, 1):
+            found = discover_month(cfg, lo, hi)
+            added = add_unique_urls(urls, seen, found)
+            print(
+                {
+                    "discover": f"{idx}/{len(windows)}",
+                    "month": f"{lo}..{hi}",
+                    "found": len(found),
+                    "added": added,
+                    "total_urls": len(urls),
+                },
+                flush=True,
+            )
+
+    if not urls:
+        print(
+            {
+                "warning": "No videos queued. If Nitter is blocked from this RunPod IP, rerun with --existing-video-jobs --skip-discovery, --urls-file, or PROXY_LIST/PROXY_FILE.",
+                "done": True,
+            },
+            flush=True,
+        )
+        return
 
     all_jobs, all_calls, all_enriched = [], [], []
     from concurrent.futures import ThreadPoolExecutor, as_completed
